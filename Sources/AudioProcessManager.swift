@@ -394,6 +394,7 @@ class AudioProcessManager: ObservableObject {
                         return CommunicationRoutingPolicy.protectsCallMedia(
                             ownerBundleID: groupKey,
                             processBundleID: process.bundleIdentifier,
+                            processName: processName(for: pid),
                             isInputting: process.isInputting
                         )
                     }
@@ -423,6 +424,9 @@ class AudioProcessManager: ObservableObject {
         }
         if communicationCallActive != isCommunicationCallProtectionActive {
             NSLog("SoundMate: 通话保护 \(communicationCallActive ? "开启" : "关闭")，保护应用数=\(nextProtectedPIDs.count)")
+        }
+        if isCommunicationCallProtectionActive && !communicationCallActive {
+            tapManager?.endCallRouting()
         }
         isCommunicationCallProtectionActive = communicationCallActive
         communicationProtectedPIDs = nextProtectedPIDs

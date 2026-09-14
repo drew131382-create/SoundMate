@@ -7,6 +7,7 @@ protocol AudioTapManagerProtocol {
     func setVolume(for pid: pid_t, volume: Float)
     func setMute(for pid: pid_t, muted: Bool)
     func setCallRouting(for pid: pid_t, enabled: Bool)
+    func endCallRouting()
     func removeTap(for pid: pid_t)
     func removeUnusedTaps(keeping activePIDs: Set<pid_t>)
     func resetAudio()
@@ -174,6 +175,24 @@ class AudioTapManager: AudioTapManagerProtocol {
                 if self.callRoutingPIDs.isEmpty {
                     self.stopUnduckTimer()
                 }
+            }
+        }
+    }
+
+    /// Release every call-only route when the communication session ends.
+    /// User-controlled non-unity volume or mute taps remain available.
+    func endCallRouting() {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            let callPIDs = self.callRoutingPIDs
+            self.callRoutingPIDs.removeAll()
+            self.stopUnduckTimer()
+            for pid in callPIDs {
+                self.removeTapIfIdle(for: pid)
+            }
+            if !callPIDs.isEmpty {
+                NSLog("SoundMate: 通话结束，释放通话专用音频路由 \(callPIDs.count) 个")
             }
         }
     }
@@ -378,6 +397,7 @@ class AudioTapManagerFallback: AudioTapManagerProtocol {
         NSLog("SoundMate: Mute control not available on this macOS version")
     }
     func setCallRouting(for pid: pid_t, enabled: Bool) {}
+    func endCallRouting() {}
     func removeTap(for pid: pid_t) {}
     func removeUnusedTaps(keeping activePIDs: Set<pid_t>) {}
     func resetAudio() {}
