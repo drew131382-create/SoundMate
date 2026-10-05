@@ -56,6 +56,12 @@ private final class SoundMateAppDelegate: NSObject, NSApplicationDelegate {
         false
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let manager else { return .terminateNow }
+        manager.shutdown { sender.reply(toApplicationShouldTerminate: true) }
+        return .terminateLater
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         popover?.performClose(nil)
         popover?.contentViewController = nil

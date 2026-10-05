@@ -5,7 +5,7 @@ import os
 /// Controls audio processing for a single app via CoreAudio process tap.
 /// Uses an aggregate device with an IO callback for real-time volume/mute control.
 @available(macOS 14.2, *)
-final class ProcessTapController {
+final class ProcessTapController: AudioRouteTap {
     let pid: pid_t
     let processObjectID: AudioObjectID
     private let logger: Logger
@@ -19,8 +19,13 @@ final class ProcessTapController {
     private nonisolated(unsafe) var _currentVolume: Float = 1.0
     /// User-controlled mute - outputs silence
     private nonisolated(unsafe) var _isMuted: Bool = false
-    /// Lightweight RMS meter used by the generic communication compensator.
-    private nonisolated(unsafe) var _measuredRMSLevel: Float = 0
+    /// Updated only by the serial I/O callback queue.
+    private var callbackCount: UInt64 = 0
+    private var validBufferCount: UInt64 = 0
+    private var requestedVolume: Float = 1
+    private var requestedMute = false
+    private var tapChannels = 2
+    private var topologyListeners: [(AudioObjectID, AudioObjectPropertyAddress, DispatchQueue, AudioObjectPropertyListenerBlock)] = []
 
     // MARK: - Non-RT State
 
@@ -38,23 +43,41 @@ final class ProcessTapController {
     // MARK: - Public Properties
 
     var volume: Float {
-        get { _volume }
-        set { _volume = max(0, min(3.0, newValue)) }
+        get { requestedVolume }
+        set {
+            requestedVolume = max(0, min(3.0, newValue))
+            updateMuteBehavior()
+            let value = requestedVolume
+            queue.async { [weak self] in self?._volume = value }
+        }
     }
 
     var isMuted: Bool {
-        get { _isMuted }
-        set { _isMuted = newValue }
+        get { requestedMute }
+        set {
+            requestedMute = newValue
+            updateMuteBehavior()
+            queue.async { [weak self] in self?._isMuted = newValue }
+        }
     }
 
-    var measuredRMSLevel: Float {
-        _measuredRMSLevel
+    var isSourceOutputting: Bool? {
+        guard (try? processObjectID.readProcessPID()) == pid else { return nil }
+        return try? processObjectID.readBool(kAudioProcessPropertyIsRunningOutput)
+    }
+
+    func readHealth(_ completion: @escaping (AudioRouteHealth) -> Void) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            completion(AudioRouteHealth(callbacks: self.callbackCount, validBuffers: self.validBufferCount))
+        }
     }
 
     // MARK: - Initialization
 
-    init?(pid: pid_t) {
-        guard let processObjectID = Self.findProcessObjectID(for: pid) else {
+    init?(pid: pid_t, processObjectID candidate: AudioObjectID? = nil) {
+        guard let processObjectID = candidate ?? Self.findProcessObjectID(for: pid),
+              (try? processObjectID.readProcessPID()) == pid else {
             return nil
         }
 
@@ -77,7 +100,7 @@ final class ProcessTapController {
         let tapDesc = CATapDescription(stereoMixdownOfProcesses: [processObjectID])
         tapDesc.uuid = UUID()
         tapDesc.isPrivate = true
-        tapDesc.muteBehavior = .mutedWhenTapped
+        tapDesc.muteBehavior = requestedMute || requestedVolume == 0 ? .muted : .mutedWhenTapped
         self.tapDescription = tapDesc
 
         var tapID: AudioObjectID = .unknown
@@ -87,6 +110,16 @@ final class ProcessTapController {
         }
 
         processTapID = tapID
+        do {
+            let format = try tapID.read(kAudioTapPropertyFormat, defaultValue: AudioStreamBasicDescription())
+            guard AudioBufferRenderer.supports(format), format.mChannelsPerFrame == 2 else {
+                throw NSError(domain: "ProcessTapController", code: -2, userInfo: [NSLocalizedDescriptionKey: "Unsupported tap format"])
+            }
+            tapChannels = Int(format.mChannelsPerFrame)
+        } catch {
+            cleanupPartialActivation()
+            throw error
+        }
 
         guard let defaultDeviceUID = getDefaultOutputDeviceUID() else {
             cleanupPartialActivation()
@@ -111,6 +144,13 @@ final class ProcessTapController {
             throw NSError(domain: "ProcessTapController", code: -1, userInfo: [NSLocalizedDescriptionKey: "Aggregate device not ready within timeout"])
         }
 
+        do {
+            try validateOutputFormats()
+        } catch {
+            cleanupPartialActivation()
+            throw error
+        }
+
         // Compute ramp coefficient from device sample rate
         let sampleRate: Float64
         if let deviceSampleRate = try? aggregateDeviceID.readNominalSampleRate() {
@@ -122,7 +162,12 @@ final class ProcessTapController {
         rampCoefficient = 1 - exp(-1 / (Float(sampleRate) * rampTimeSeconds))
 
         err = AudioDeviceCreateIOProcIDWithBlock(&deviceProcID, aggregateDeviceID, queue) { [weak self] _, inInputData, _, outOutputData, _ in
-            guard let self else { return }
+            guard let self else {
+                for buffer in UnsafeMutableAudioBufferListPointer(outOutputData) {
+                    if let data = buffer.mData { memset(data, 0, Int(buffer.mDataByteSize)) }
+                }
+                return
+            }
             self.processAudio(inInputData, to: outOutputData)
         }
         guard err == noErr else {
@@ -130,32 +175,119 @@ final class ProcessTapController {
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "Failed to create IO proc: \(err)"])
         }
 
+        queue.sync {
+            _volume = requestedVolume
+            _currentVolume = requestedVolume
+            _isMuted = requestedMute
+            callbackCount = 0
+            validBufferCount = 0
+        }
         err = AudioDeviceStart(aggregateDeviceID, deviceProcID)
         guard err == noErr else {
             cleanupPartialActivation()
             throw NSError(domain: NSOSStatusErrorDomain, code: Int(err), userInfo: [NSLocalizedDescriptionKey: "Failed to start device: \(err)"])
         }
 
-        _currentVolume = _volume
         activated = true
         logger.info("Tap activated for PID \(self.pid)")
     }
 
-    func invalidate() {
-        guard activated else { return }
+    /// Called on the manager's control queue. Finish release before replacement.
+    @discardableResult
+    func invalidate() -> Bool {
         activated = false
+        for (object, address, listenerQueue, block) in topologyListeners {
+            var mutableAddress = address
+            let status = AudioObjectRemovePropertyListenerBlock(object, &mutableAddress, listenerQueue, block)
+            if status != noErr && status != kAudioHardwareBadObjectError {
+                logger.error("Listener removal failed object=\(object), status=\(status)")
+            }
+        }
+        topologyListeners.removeAll()
+        if let procID = deviceProcID, aggregateDeviceID != .unknown {
+            let stop = AudioDeviceStop(aggregateDeviceID, procID)
+            let destroy = AudioDeviceDestroyIOProcID(aggregateDeviceID, procID)
+            logger.notice("I/O release pid=\(self.pid), stop=\(stop), destroy=\(destroy)")
+            if destroy == noErr || destroy == kAudioHardwareBadObjectError { deviceProcID = nil }
+        }
+        if aggregateDeviceID != .unknown {
+            let status = AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
+            logger.notice("Aggregate release pid=\(self.pid), status=\(status)")
+            if status == noErr || status == kAudioHardwareBadObjectError {
+                aggregateDeviceID = .unknown
+                deviceProcID = nil
+            }
+        }
+        if processTapID != .unknown {
+            let status = AudioHardwareDestroyProcessTap(processTapID)
+            logger.notice("Tap release pid=\(self.pid), status=\(status)")
+            if status == noErr || status == kAudioHardwareBadObjectError {
+                processTapID = .unknown
+                tapDescription = nil
+            }
+        }
+        return aggregateDeviceID == .unknown && processTapID == .unknown && deviceProcID == nil
+    }
 
-        let primaryAggregate = aggregateDeviceID
-        let primaryProcID = deviceProcID
-        let primaryTap = processTapID
+    func watchTopology(on controlQueue: DispatchQueue, changed: @escaping () -> Void) {
+        let properties: [(AudioObjectID, AudioObjectPropertySelector, AudioObjectPropertyScope)] = [
+            (outputDeviceID, kAudioDevicePropertyDeviceIsAlive, kAudioObjectPropertyScopeGlobal),
+            (outputDeviceID, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal),
+            (outputDeviceID, kAudioDevicePropertyStreamConfiguration, kAudioObjectPropertyScopeOutput),
+            (processTapID, kAudioTapPropertyFormat, kAudioObjectPropertyScopeGlobal)
+        ]
+        for (object, selector, scope) in properties {
+            addTopologyListener(object: object, selector: selector, scope: scope, queue: controlQueue, changed: changed)
+        }
+        for stream in outputStreams() {
+            addTopologyListener(object: stream, selector: kAudioStreamPropertyVirtualFormat,
+                                scope: kAudioObjectPropertyScopeGlobal, queue: controlQueue, changed: changed)
+        }
+    }
 
-        aggregateDeviceID = .unknown
-        deviceProcID = nil
-        processTapID = .unknown
-        tapDescription = nil
+    private func addTopologyListener(object: AudioObjectID, selector: AudioObjectPropertySelector,
+                                     scope: AudioObjectPropertyScope, queue: DispatchQueue, changed: @escaping () -> Void) {
+        var address = AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectHasProperty(object, &address) else { return }
+        // Queue the recovery after HAL finishes delivering this notification.
+        let block: AudioObjectPropertyListenerBlock = { _, _ in queue.async(execute: changed) }
+        let status = AudioObjectAddPropertyListenerBlock(object, &address, queue, block)
+        if status == noErr { topologyListeners.append((object, address, queue, block)) }
+        else { logger.error("Topology listener failed object=\(object), selector=\(selector), status=\(status)") }
+    }
 
-        DispatchQueue.global(qos: .utility).async {
-            Self.destroyTap(aggregateID: primaryAggregate, deviceProcID: primaryProcID, tapID: primaryTap)
+    private func updateMuteBehavior() {
+        guard activated, let description = tapDescription else { return }
+        let desired: CATapMuteBehavior = requestedMute || requestedVolume == 0 ? .muted : .mutedWhenTapped
+        guard description.muteBehavior != desired else { return }
+        description.muteBehavior = desired
+        var reference = description
+        var address = AudioObjectPropertyAddress(mSelector: kAudioTapPropertyDescription,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        let status = withUnsafePointer(to: &reference) {
+            AudioObjectSetPropertyData(processTapID, &address, 0, nil, UInt32(MemoryLayout<CATapDescription>.size), $0)
+        }
+        if status != noErr { logger.error("Tap mute behavior change failed pid=\(self.pid), status=\(status)") }
+    }
+
+    private func outputStreams() -> [AudioObjectID] {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams,
+            mScope: kAudioObjectPropertyScopeOutput, mElement: kAudioObjectPropertyElementMain)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(aggregateDeviceID, &address, 0, nil, &size) == noErr, size > 0 else { return [] }
+        var streams = [AudioObjectID](repeating: .unknown, count: Int(size) / MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(aggregateDeviceID, &address, 0, nil, &size, &streams) == noErr else { return [] }
+        return streams
+    }
+
+    private func validateOutputFormats() throws {
+        let streams = outputStreams()
+        guard !streams.isEmpty else { throw NSError(domain: "ProcessTapController", code: -3) }
+        for stream in streams {
+            let format = try stream.read(kAudioStreamPropertyVirtualFormat, defaultValue: AudioStreamBasicDescription())
+            guard AudioBufferRenderer.supports(format) else {
+                throw NSError(domain: "ProcessTapController", code: -2, userInfo: [NSLocalizedDescriptionKey: "Unsupported output format"])
+            }
         }
     }
 
@@ -258,31 +390,7 @@ final class ProcessTapController {
     }
 
     private func cleanupPartialActivation() {
-        if let procID = deviceProcID {
-            AudioDeviceDestroyIOProcID(aggregateDeviceID, procID)
-            deviceProcID = nil
-        }
-        if aggregateDeviceID != kAudioObjectUnknown {
-            AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
-            aggregateDeviceID = .unknown
-        }
-        if processTapID != kAudioObjectUnknown {
-            AudioHardwareDestroyProcessTap(processTapID)
-            processTapID = .unknown
-        }
-    }
-
-    private static func destroyTap(aggregateID: AudioObjectID, deviceProcID: AudioDeviceIOProcID?, tapID: AudioObjectID) {
-        if let procID = deviceProcID, aggregateID != kAudioObjectUnknown {
-            AudioDeviceStop(aggregateID, procID)
-            AudioDeviceDestroyIOProcID(aggregateID, procID)
-        }
-        if aggregateID != kAudioObjectUnknown {
-            AudioHardwareDestroyAggregateDevice(aggregateID)
-        }
-        if tapID != kAudioObjectUnknown {
-            AudioHardwareDestroyProcessTap(tapID)
-        }
+        _ = invalidate()
     }
 
     /// The undocumented HAL 'duck' property is capability-checked on each device.
@@ -327,91 +435,15 @@ final class ProcessTapController {
     // MARK: - RT-Safe Audio Callback
 
     private func processAudio(_ inputBufferList: UnsafePointer<AudioBufferList>, to outputBufferList: UnsafeMutablePointer<AudioBufferList>) {
-        let outputBuffers = UnsafeMutableAudioBufferListPointer(outputBufferList)
-        let inputBuffers = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inputBufferList))
-
-        if _isMuted {
-            for outputBuffer in outputBuffers {
-                guard let outputData = outputBuffer.mData else { continue }
-                memset(outputData, 0, Int(outputBuffer.mDataByteSize))
-            }
-            return
-        }
-
-        let targetVol = _volume
-        var currentVol = _currentVolume
-
-        let inputBufferCount = inputBuffers.count
-        let outputBufferCount = outputBuffers.count
-        var levelSumSquares: Float = 0
-        var levelSampleCount = 0
-
-        for outputIndex in 0..<outputBufferCount {
-            let outputBuffer = outputBuffers[outputIndex]
-            guard let outputData = outputBuffer.mData else { continue }
-
-            let inputIndex: Int
-            if inputBufferCount > outputBufferCount {
-                inputIndex = inputBufferCount - outputBufferCount + outputIndex
-            } else {
-                inputIndex = outputIndex
-            }
-
-            guard inputIndex < inputBufferCount else {
-                memset(outputData, 0, Int(outputBuffer.mDataByteSize))
-                continue
-            }
-
-            let inputBuffer = inputBuffers[inputIndex]
-            guard let inputData = inputBuffer.mData else {
-                memset(outputData, 0, Int(outputBuffer.mDataByteSize))
-                continue
-            }
-
-            let inputSamples = inputData.assumingMemoryBound(to: Float.self)
-            let outputSamples = outputData.assumingMemoryBound(to: Float.self)
-            let inputSampleCount = Int(inputBuffer.mDataByteSize) / MemoryLayout<Float>.size
-            let outputSampleCount = Int(outputBuffer.mDataByteSize) / MemoryLayout<Float>.size
-            let count = min(inputSampleCount, outputSampleCount)
-
-            for i in 0..<count {
-                currentVol += (targetVol - currentVol) * rampCoefficient
-                let inputSample = inputSamples[i]
-                levelSumSquares += inputSample * inputSample
-                levelSampleCount += 1
-                outputSamples[i] = Self.renderSample(inputSample, gain: currentVol)
-            }
-        }
-
-        _currentVolume = currentVol
-        if levelSampleCount > 0 {
-            let frameRMS = sqrt(levelSumSquares / Float(levelSampleCount))
-            _measuredRMSLevel = (_measuredRMSLevel * 0.85) + (frameRMS * 0.15)
+        callbackCount &+= 1
+        if AudioBufferRenderer.render(input: inputBufferList, output: outputBufferList,
+                                      tapChannels: tapChannels, targetVolume: _volume,
+                                      currentVolume: &_currentVolume, rampCoefficient: rampCoefficient, muted: _isMuted) {
+            validBufferCount &+= 1
         }
     }
 
-    /// Unity/attenuation preserve the waveform, including near-full-scale peaks.
-    /// Only a user-selected boost (including its ramp down) needs a limiter.
     static func renderSample(_ sample: Float, gain: Float) -> Float {
-        let scaled = sample * gain
-        return gain > 1 ? softLimit(scaled) : scaled
-    }
-
-    /// Soft-knee limiter to avoid clipping above unity gain
-    @inline(__always)
-    private static func softLimit(_ sample: Float) -> Float {
-        let threshold: Float = 0.8
-        let ceiling: Float = 1.0
-
-        let absSample = abs(sample)
-        if absSample <= threshold {
-            return sample
-        }
-
-        let overshoot = absSample - threshold
-        let headroom = ceiling - threshold
-        let compressed = threshold + headroom * (overshoot / (overshoot + headroom))
-
-        return sample >= 0 ? compressed : -compressed
+        AudioBufferRenderer.renderSample(sample, gain: gain)
     }
 }

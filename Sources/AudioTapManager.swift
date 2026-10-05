@@ -1,231 +1,170 @@
+import AppKit
 import CoreAudio
 import Darwin
 import Foundation
+import os
 
-/// Protocol for audio tap management
 protocol AudioTapManagerProtocol {
-    func setVolume(for pid: pid_t, volume: Float)
-    func setMute(for pid: pid_t, muted: Bool)
-    func setCallRouting(for pid: pid_t, enabled: Bool)
-    func endCallRouting()
-    func removeTap(for pid: pid_t)
-    func removeUnusedTaps(keeping activePIDs: Set<pid_t>)
+    var onRecoveryStateChange: (([pid_t: String]) -> Void)? { get set }
+    func updateRoutes(_ targets: [AudioRouteTarget], callEnded: Bool)
+    func setState(for pid: pid_t, volume: Float, muted: Bool)
     func resetAudio()
+    func resetAudio(for pid: pid_t)
+    func shutdown(completion: @escaping () -> Void)
 }
 
-/// Factory to create the appropriate tap manager based on OS version
 class AudioTapManagerFactory {
     static func create() -> AudioTapManagerProtocol {
-        if #available(macOS 14.2, *) {
-            return AudioTapManager()
-        } else {
-            return AudioTapManagerFallback()
-        }
+        if #available(macOS 14.2, *) { return AudioTapManager() }
+        return AudioTapManagerFallback()
     }
 }
 
-/// Audio tap manager using ProcessTapController for proper volume/mute control
 @available(macOS 14.2, *)
-class AudioTapManager: AudioTapManagerProtocol {
-
-    private var activeTaps: [pid_t: ProcessTapController] = [:]
-    private var tapStates: [pid_t: (volume: Float, muted: Bool)] = [:]
-    /// Keep unity-gain routes alive during calls without amplifying media.
-    private var callRoutingPIDs: Set<pid_t> = []
+final class AudioTapManager: AudioTapManagerProtocol {
+    var onRecoveryStateChange: (([pid_t: String]) -> Void)?
+    private let queue = DispatchQueue(label: "com.soundmate.audiotap", qos: .userInitiated)
+    private let logger = Logger(subsystem: "SoundMate", category: "AudioRoutes")
+    private var healthTimer: DispatchSourceTimer?
     private var unduckTimer: DispatchSourceTimer?
     private var lastDefaultDuckingResult: String?
-    private let queue = DispatchQueue(label: "com.soundmate.audiotap", qos: .userInteractive)
-
     private var deviceChangeListenerBlock: AudioObjectPropertyListenerBlock?
+    private var wakeObserver: NSObjectProtocol?
+    private var stopped = false
     private var deviceChangePropertyAddress = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDefaultOutputDevice,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )
+    private lazy var routes = AudioRouteCoordinator(
+        queue: queue,
+        makeTap: {
+            guard let tap = ProcessTapController(pid: $0.pid, processObjectID: $0.processObjectID),
+                  tap.isSourceOutputting == true else { return nil }
+            return tap
+        },
+        log: { [logger] message in logger.notice("\(message, privacy: .public)") }
+    )
 
     init() {
-        NSLog("SoundMate: AudioTapManager initialized")
-        startDeviceChangeListener()
+        routes.onFailureChange = { [weak self] failures in
+            guard let self else { return }
+            self.refreshTimers()
+            DispatchQueue.main.async { [weak self] in self?.onRecoveryStateChange?(failures) }
+        }
+        deviceChangeListenerBlock = { [weak self] _, _ in
+            guard let self else { return }
+            self.queue.async { [weak self] in self?.handleDeviceChange() }
+        }
+        let status = AudioObjectAddPropertyListenerBlock(
+            AudioObjectID(kAudioObjectSystemObject), &deviceChangePropertyAddress,
+            queue, deviceChangeListenerBlock!
+        )
+        if status != noErr { logger.error("Default device listener failed status=\(status)") }
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            self?.queue.async { [weak self] in self?.handleDeviceChange() }
+        }
     }
 
     deinit {
+        healthTimer?.cancel()
         unduckTimer?.cancel()
+        if let wakeObserver { NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver) }
         if let block = deviceChangeListenerBlock {
-            AudioObjectRemovePropertyListenerBlock(
-                AudioObjectID(kAudioObjectSystemObject),
-                &deviceChangePropertyAddress,
-                queue,
-                block
-            )
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject),
+                &deviceChangePropertyAddress, queue, block)
         }
-        for (_, tap) in activeTaps {
-            tap.invalidate()
+        // Normal termination explicitly drains this queue before deinitializing.
+        _ = routes.shutdown()
+    }
+
+    func updateRoutes(_ targets: [AudioRouteTarget], callEnded: Bool) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.routes.reconcile(targets, callEnded: callEnded)
+            self.refreshTimers()
         }
     }
 
-    private func startDeviceChangeListener() {
-        deviceChangeListenerBlock = { [weak self] _, _ in
-            self?.handleDeviceChange()
+    func setState(for pid: pid_t, volume: Float, muted: Bool) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.routes.setState(pid: pid, volume: volume, muted: muted)
+            self.refreshTimers()
         }
+    }
 
-        let status = AudioObjectAddPropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject),
-            &deviceChangePropertyAddress,
-            queue,
-            deviceChangeListenerBlock!
-        )
+    func resetAudio() {
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.routes.reset()
+            self.refreshTimers()
+        }
+    }
 
-        if status != noErr {
-            NSLog("SoundMate: Failed to register device change listener: \(status)")
+    func resetAudio(for pid: pid_t) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.routes.reset(pid: pid)
+            self.refreshTimers()
+        }
+    }
+
+    func shutdown(completion: @escaping () -> Void) {
+        queue.async { [self] in
+            stopped = true
+            healthTimer?.cancel()
+            healthTimer = nil
+            stopUnduckTimer()
+            let released = routes.shutdown()
+            logger.notice("Audio shutdown released=\(released)")
+            DispatchQueue.main.async(execute: completion)
         }
     }
 
     private func handleDeviceChange() {
-        NSLog("SoundMate: Output device changed - recreating taps")
-
-        for (pid, tap) in activeTaps {
-            tapStates[pid] = (volume: tap.volume, muted: tap.isMuted)
-        }
-
-        let pidsToRecreate = Array(activeTaps.keys)
-        for (pid, tap) in activeTaps {
-            tap.invalidate()
-            NSLog("SoundMate: Invalidated tap for PID: \(pid)")
-        }
-        activeTaps.removeAll()
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-            guard let self = self else { return }
-
-            self.queue.async {
-                for pid in pidsToRecreate {
-                    self.recreateTapWithRetry(pid: pid, attempt: 1, maxAttempts: 3)
-                }
-            }
-        }
+        guard !stopped else { return }
+        logger.notice("Default output changed or system woke; refreshing routes")
+        routes.topologyChanged()
+        refreshTimers()
     }
 
-    private func recreateTapWithRetry(pid: pid_t, attempt: Int, maxAttempts: Int) {
-        guard let tap = ProcessTapController(pid: pid) else {
-            if attempt < maxAttempts {
-                let delay = Double(attempt) * 0.1
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    self?.queue.async {
-                        self?.recreateTapWithRetry(pid: pid, attempt: attempt + 1, maxAttempts: maxAttempts)
-                    }
-                }
-            } else {
-                NSLog("SoundMate: Could not recreate tap for PID \(pid)")
+    private func refreshTimers() {
+        if !stopped && routes.hasRoutes {
+            if healthTimer == nil {
+                let timer = DispatchSource.makeTimerSource(queue: queue)
+                timer.schedule(deadline: .now() + 1, repeating: 1, leeway: .milliseconds(100))
+                timer.setEventHandler { [weak self] in self?.routes.checkHealth() }
+                healthTimer = timer
+                timer.resume()
             }
-            return
+        } else {
+            healthTimer?.cancel()
+            healthTimer = nil
         }
-
-        do {
-            if let state = self.tapStates[pid] {
-                tap.volume = state.volume
-                tap.isMuted = state.muted
-            }
-            try tap.activate()
-
-            self.activeTaps[pid] = tap
-        } catch {
-            if attempt < maxAttempts {
-                let delay = Double(attempt) * 0.1
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-                    self?.queue.async {
-                        self?.recreateTapWithRetry(pid: pid, attempt: attempt + 1, maxAttempts: maxAttempts)
-                    }
-                }
-            } else {
-                NSLog("SoundMate: Failed to reactivate tap for PID \(pid): \(error.localizedDescription)")
-            }
-        }
+        if !stopped && !routes.protectedTaps.isEmpty { startUnduckTimer() }
+        else { stopUnduckTimer() }
     }
 
-    func setVolume(for pid: pid_t, volume: Float) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-
-            if let existingTap = self.activeTaps[pid] {
-                existingTap.volume = volume
-                self.tapStates[pid] = (volume: volume, muted: existingTap.isMuted)
-                self.removeTapIfIdle(for: pid)
-            } else {
-                if volume != 1.0 {
-                    self.tapStates[pid] = (volume: volume, muted: false)
-                    self.ensureTapExists(for: pid)
-                    self.activeTaps[pid]?.volume = volume
-                    self.tapStates[pid] = (volume: volume, muted: false)
-                }
-            }
-        }
-    }
-
-    func setCallRouting(for pid: pid_t, enabled: Bool) {
-        queue.async { [weak self] in
-            guard let self else { return }
-
-            if enabled {
-                self.callRoutingPIDs.insert(pid)
-                self.startUnduckTimer()
-                self.ensureTapExists(for: pid)
-            } else {
-                self.callRoutingPIDs.remove(pid)
-                self.removeTapIfIdle(for: pid)
-                if self.callRoutingPIDs.isEmpty {
-                    self.stopUnduckTimer()
-                }
-            }
-        }
-    }
-
-    /// Release every call-only route when the communication session ends.
-    /// User-controlled non-unity volume or mute taps remain available.
-    func endCallRouting() {
-        queue.async { [weak self] in
-            guard let self else { return }
-
-            let callPIDs = self.callRoutingPIDs
-            self.callRoutingPIDs.removeAll()
-            self.stopUnduckTimer()
-            for pid in callPIDs {
-                self.removeTapIfIdle(for: pid)
-            }
-            if !callPIDs.isEmpty {
-                NSLog("SoundMate: 通话结束，释放通话专用音频路由 \(callPIDs.count) 个")
-            }
-        }
-    }
-
-    /// Restore the output device while a call route is active. The timer is lazy
-    /// so simply opening SoundMate never changes the system audio path.
     private func startUnduckTimer() {
         guard unduckTimer == nil else { return }
-        NSLog("SoundMate: Starting device ducking restore timer")
         let timer = DispatchSource.makeTimerSource(queue: queue)
         timer.schedule(deadline: .now(), repeating: 0.5, leeway: .milliseconds(50))
         timer.setEventHandler { [weak self] in
-            guard let self else { return }
-            if self.lastDefaultDuckingResult == nil {
-                NSLog("SoundMate: Device ducking restore timer fired")
-            }
+            guard let self, !self.stopped, !self.routes.protectedTaps.isEmpty else { return }
             self.restoreDefaultDeviceDucking()
-            // Private aggregate devices can also expose the same property. Keep
-            // their routes at unity while they are owned by this manager.
-            for tap in self.activeTaps.values {
-                tap.restoreDeviceDucking()
-            }
+            for tap in self.routes.protectedTaps { tap.restoreDeviceDucking() }
         }
         unduckTimer = timer
         timer.resume()
     }
 
     private func stopUnduckTimer() {
-        guard unduckTimer != nil else { return }
         unduckTimer?.cancel()
         unduckTimer = nil
         lastDefaultDuckingResult = nil
-        NSLog("SoundMate: Stopped device ducking restore timer")
     }
 
     private func restoreDefaultDeviceDucking() {
@@ -279,130 +218,13 @@ class AudioTapManager: AudioTapManagerProtocol {
         NSLog("SoundMate: Default device ducking restore: \(result)")
     }
 
-    func setMute(for pid: pid_t, muted: Bool) {
-        queue.async { [weak self] in
-            guard let self = self else { return }
-
-            if let existingTap = self.activeTaps[pid] {
-                existingTap.isMuted = muted
-                self.tapStates[pid] = (volume: existingTap.volume, muted: muted)
-                self.removeTapIfIdle(for: pid)
-            } else {
-                if muted {
-                    self.tapStates[pid] = (volume: 1.0, muted: true)
-                    self.ensureTapExists(for: pid)
-                    if let tap = self.activeTaps[pid] {
-                        tap.isMuted = muted
-                    }
-                } else {
-                    self.tapStates.removeValue(forKey: pid)
-                }
-            }
-        }
-    }
-
-    func removeTap(for pid: pid_t) {
-        queue.async { [weak self] in
-            self?.callRoutingPIDs.remove(pid)
-            if let tap = self?.activeTaps.removeValue(forKey: pid) {
-                tap.invalidate()
-            }
-            self?.tapStates.removeValue(forKey: pid)
-        }
-    }
-
-    func removeUnusedTaps(keeping activePIDs: Set<pid_t>) {
-        queue.async { [weak self] in
-            guard let self else { return }
-
-            self.callRoutingPIDs.formIntersection(activePIDs)
-            if self.callRoutingPIDs.isEmpty {
-                self.stopUnduckTimer()
-            }
-            let staleStatePIDs = Set(self.tapStates.keys).subtracting(activePIDs)
-            for pid in staleStatePIDs {
-                self.tapStates.removeValue(forKey: pid)
-            }
-
-            let stalePIDs = Set(self.activeTaps.keys).subtracting(activePIDs)
-            for pid in stalePIDs {
-                if let tap = self.activeTaps.removeValue(forKey: pid) {
-                    tap.invalidate()
-                    self.tapStates.removeValue(forKey: pid)
-                }
-            }
-        }
-    }
-
-    func resetAudio() {
-        queue.async { [weak self] in
-            guard let self else { return }
-
-            for (pid, tap) in self.activeTaps {
-                self.tapStates[pid] = (volume: tap.volume, muted: tap.isMuted)
-                tap.invalidate()
-            }
-
-            let pidsToRecreate = self.tapStates.keys.filter { self.isProcessRunning($0) }
-            self.activeTaps.removeAll()
-
-            for pid in pidsToRecreate {
-                self.recreateTapWithRetry(pid: pid, attempt: 1, maxAttempts: 3)
-            }
-        }
-    }
-
-    private func removeTapIfIdle(for pid: pid_t) {
-        guard !callRoutingPIDs.contains(pid) else { return }
-        guard let tap = activeTaps[pid], tap.volume == 1.0, !tap.isMuted else { return }
-        activeTaps.removeValue(forKey: pid)
-        tapStates.removeValue(forKey: pid)
-        tap.invalidate()
-    }
-
-    // MARK: - Private Implementation
-
-    private func ensureTapExists(for pid: pid_t) {
-        guard activeTaps[pid] == nil else { return }
-
-        guard let tap = ProcessTapController(pid: pid) else {
-            NSLog("SoundMate: Could not create ProcessTapController for PID \(pid)")
-            return
-        }
-
-        do {
-            if let state = tapStates[pid] {
-                tap.volume = state.volume
-                tap.isMuted = state.muted
-            }
-            try tap.activate()
-            activeTaps[pid] = tap
-        } catch {
-            NSLog("SoundMate: Failed to activate tap for PID \(pid): \(error.localizedDescription)")
-        }
-    }
-
-    private func isProcessRunning(_ pid: pid_t) -> Bool {
-        kill(pid, 0) == 0 || errno == EPERM
-    }
 }
 
-// MARK: - Fallback for older macOS
-
-class AudioTapManagerFallback: AudioTapManagerProtocol {
-    func setVolume(for pid: pid_t, volume: Float) {
-        NSLog("SoundMate: Volume control not available on this macOS version")
-    }
-    func setMute(for pid: pid_t, muted: Bool) {
-        NSLog("SoundMate: Mute control not available on this macOS version")
-    }
-    func setCallRouting(for pid: pid_t, enabled: Bool) {}
-    func endCallRouting() {}
-    func removeTap(for pid: pid_t) {}
-    func removeUnusedTaps(keeping activePIDs: Set<pid_t>) {}
+final class AudioTapManagerFallback: AudioTapManagerProtocol {
+    var onRecoveryStateChange: (([pid_t: String]) -> Void)?
+    func updateRoutes(_ targets: [AudioRouteTarget], callEnded: Bool) {}
+    func setState(for pid: pid_t, volume: Float, muted: Bool) {}
     func resetAudio() {}
-
-    init() {
-        NSLog("SoundMate: AudioTap requires macOS 14.2+")
-    }
+    func resetAudio(for pid: pid_t) {}
+    func shutdown(completion: @escaping () -> Void) { completion() }
 }

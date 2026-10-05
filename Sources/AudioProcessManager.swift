@@ -29,6 +29,8 @@ class AudioProcessManager: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private let volumeState = VolumeState()
     private var isUpdatingAudioApps = false
+    private var isShuttingDown = false
+    @Published private(set) var audioRecoveryMessage: String?
     /// 当前存在 Core Audio 进程对象的 PID 集合。
     /// 这比瞬时的“正在输出”集合稳定，适合绑定各通话软件的动态 Helper。
     private var audioPIDs: Set<pid_t> = []
@@ -96,6 +98,14 @@ class AudioProcessManager: ObservableObject {
             UserDefaults.standard.array(forKey: communicationExcludedDefaultsKey) as? [String] ?? []
         )
         tapManager = AudioTapManagerFactory.create()
+        tapManager?.onRecoveryStateChange = { [weak self] failures in
+            guard let self else { return }
+            let message = failures.sorted { $0.key < $1.key }.map { pid, message in
+                let name = self.audioApps.first { $0.outputPIDs.contains(pid) }?.name ?? "PID \(pid)"
+                return "\(name)：\(message)"
+            }.joined(separator: "；")
+            self.audioRecoveryMessage = message.isEmpty ? nil : message
+        }
         deviceVolume.onStateChange = { [weak self] in
             self?.syncMasterFromDevice()
         }
@@ -147,6 +157,7 @@ class AudioProcessManager: ObservableObject {
     /// alive while the machine is idle.
     private func scheduleMonitoringTimer() {
         updateTimer?.invalidate()
+        guard !isShuttingDown else { return }
 
         let interval: TimeInterval
         if isCommunicationCallProtectionActive || !communicationProtectedPIDs.isEmpty {
@@ -167,7 +178,7 @@ class AudioProcessManager: ObservableObject {
     /// 更新应用列表：显示当前存在 Core Audio 进程对象的应用。
     /// 是否正在输出单独记录，不用瞬时状态决定应用是否从列表消失。
     func updateAudioApps() async {
-        guard !isUpdatingAudioApps else { return }
+        guard !isShuttingDown, !isUpdatingAudioApps else { return }
         isUpdatingAudioApps = true
         defer {
             isUpdatingAudioApps = false
@@ -179,7 +190,7 @@ class AudioProcessManager: ObservableObject {
         let queryResult = await Task.detached(priority: .userInitiated) {
             Self.getAudioProcessesUsingHelper(excluding: myPID)
         }.value
-        guard let activeProcesses = queryResult else {
+        guard !isShuttingDown, let activeProcesses = queryResult else {
             // Core Audio 查询失败或超时时保留现有列表，不要误清空界面。
             return
         }
@@ -349,12 +360,6 @@ class AudioProcessManager: ObservableObject {
             NSLog("SoundMate: 应用归并结果 \(newApps.count) 个: \(groupDescriptions)")
         }
 
-        // Keep taps only for non-system process objects that are actually
-        // outputting. Input-only processes and silent helpers should not keep
-        // an aggregate device or real-time IO callback alive.
-        let outputtingAppPIDs = Set(newApps.flatMap(\.outputPIDs))
-        tapManager?.removeUnusedTaps(keeping: outputtingAppPIDs)
-
         self.audioApps = newApps
 
         // 通话候选：同一应用组同时存在输入和输出音频。连续两次观察到
@@ -401,16 +406,8 @@ class AudioProcessManager: ObservableObject {
                 })
             : []
 
-        for pid in communicationProtectedPIDs.subtracting(nextProtectedPIDs) {
-            tapManager?.setCallRouting(for: pid, enabled: false)
-        }
-        if communicationCallActive {
-            for pid in nextProtectedPIDs {
-                if !communicationProtectedPIDs.contains(pid) {
-                    NSLog("SoundMate: 通话媒体保护 PID=\(pid), bundle=\(processByPID[pid]?.bundleIdentifier ?? "unknown")")
-                }
-                tapManager?.setCallRouting(for: pid, enabled: true)
-            }
+        for pid in nextProtectedPIDs.subtracting(communicationProtectedPIDs) {
+            NSLog("SoundMate: 通话媒体保护 PID=\(pid), bundle=\(processByPID[pid]?.bundleIdentifier ?? "unknown")")
         }
 
         let activeNames = activeCallKeys.compactMap { key in
@@ -425,15 +422,18 @@ class AudioProcessManager: ObservableObject {
         if communicationCallActive != isCommunicationCallProtectionActive {
             NSLog("SoundMate: 通话保护 \(communicationCallActive ? "开启" : "关闭")，保护应用数=\(nextProtectedPIDs.count)")
         }
-        if isCommunicationCallProtectionActive && !communicationCallActive {
-            tapManager?.endCallRouting()
-        }
+        let callEnded = isCommunicationCallProtectionActive && !communicationCallActive
         isCommunicationCallProtectionActive = communicationCallActive
         communicationProtectedPIDs = nextProtectedPIDs
 
-        for app in newApps {
-            applyEffectiveState(to: app)
+        let targets = newApps.flatMap { app in
+            app.outputPIDs.compactMap { pid -> AudioRouteTarget? in
+                guard let process = processByPID[pid] else { return nil }
+                return AudioRouteTarget(pid: pid, processObjectID: process.objectID,
+                    volume: app.volume, muted: app.isMuted, callProtected: nextProtectedPIDs.contains(pid))
+            }
         }
+        tapManager?.updateRoutes(targets, callEnded: callEnded)
     }
 
     /// 找到一个进程的宿主主应用（用于 Helper / 子进程）
@@ -482,8 +482,7 @@ class AudioProcessManager: ObservableObject {
         let desiredMute = desiredMutesByIdentifier[identifier] ?? app.isMuted
 
         for pid in app.outputPIDs where outputAudioPIDs.contains(pid) {
-            tapManager?.setVolume(for: pid, volume: desiredVolume)
-            tapManager?.setMute(for: pid, muted: desiredMute)
+            tapManager?.setState(for: pid, volume: desiredVolume, muted: desiredMute)
         }
     }
 
@@ -526,14 +525,27 @@ class AudioProcessManager: ObservableObject {
         desiredMutesByIdentifier[identifier] = isMuted
         volumeState.setMute(for: app.id, to: isMuted, identifier: identifier)
 
-        for pid in app.outputPIDs where outputAudioPIDs.contains(pid) {
-            tapManager?.setMute(for: pid, muted: isMuted)
-        }
+        applyEffectiveState(to: audioApps[index])
     }
 
     /// Recreate active taps when audio starts glitching or output state gets stuck.
     func resetAudio() {
         tapManager?.resetAudio()
+    }
+
+    func resetAudio(for app: AudioApp) {
+        for pid in app.outputPIDs { tapManager?.resetAudio(for: pid) }
+        Task { await updateAudioApps() }
+    }
+
+    func shutdown(completion: @escaping () -> Void) {
+        isShuttingDown = true
+        updateTimer?.invalidate()
+        updateTimer = nil
+        cancellables.removeAll()
+        deviceVolume.stop()
+        guard let tapManager else { completion(); return }
+        tapManager.shutdown(completion: completion)
     }
 
     // MARK: - Visibility

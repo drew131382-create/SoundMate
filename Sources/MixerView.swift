@@ -174,6 +174,9 @@ struct MixerView: View {
                             } onResetVolume: {
                                 manager.resetVolume(for: app)
                             }
+                            .contextMenu {
+                                Button("恢复此应用音频") { manager.resetAudio(for: app) }
+                            }
                         }
                     }
                     .padding(.vertical, 2)
@@ -228,6 +231,14 @@ struct MixerView: View {
 
     private var footer: some View {
         VStack(spacing: 7) {
+            if let message = manager.audioRecoveryMessage {
+                Label(message, systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(3)
+                    .help(message)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             if manager.isCommunicationCallProtectionActive {
                 let names = manager.activeCommunicationAppNames.joined(separator: "、")
                 Label("\(names.isEmpty ? "通话" : names) 中：SoundMate 正在保持其他应用原音量", systemImage: "phone.badge.waveform.fill")
@@ -243,6 +254,9 @@ struct MixerView: View {
                 .font(.caption)
 
                 Spacer()
+
+                Button("重置音频") { manager.resetAudio() }
+                    .font(.caption)
             }
         }
     }
