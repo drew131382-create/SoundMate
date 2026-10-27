@@ -29,6 +29,17 @@ SoundMate 与普通应用音量调节工具的核心区别，是专门解决通�
 
 设备属性的调查参考：[Unduck-Pro 的设备 ducking 实现](https://github.com/MrRockySL/Unduck-Pro/blob/main/Sources/DuckAudioCore/PerAppTapEngine.swift)。这里的 `duck` 属性并非 Apple 公开支持的 API，不能保证未来系统版本兼容。
 
+## 下载与安装
+
+前往 [GitHub Releases](https://github.com/drew131382-create/SoundMate/releases/latest) 下载 `SoundMate-3.1.0.dmg`。安装包支持 Apple 芯片和 Intel Mac，要求 macOS 14.2 或更新版本。
+
+1. 打开 DMG，将 `SoundMate.app` 拖入“应用程序”。
+2. 从“应用程序”打开 SoundMate。应用驻留在菜单栏，点击菜单栏图标打开控制面板。
+3. 首次使用独立音量控制时，按系统提示允许音频捕获；权限可在“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中检查。系统版本不同，选项名称可能略有区别。
+4. 如果系统提示无法验证开发者或无法检查恶意软件，在确认下载来源可信后，可参照 [Apple 官方说明](https://support.apple.com/zh-cn/102445)在“隐私与安全性”中选择“仍要打开”。此版本使用临时签名，尚未取得 Developer ID 签名或 Apple 公证。
+
+如果之前使用过旧版 `MacVolume`，请先退出旧版再打开 SoundMate。两者使用不同的应用标识，旧版保存的音量、静音和系统权限不会自动迁移；首次使用时请重新检查设置和授权。
+
 ## 验证
 
 2026-10-05 音频恢复改动通过自动故障测试与 arm64 + x86_64 Release 编译。故障测试覆盖通话结束保留音量、静音、旧任务取消、同 PID 对象变化、释放失败、有限重试、回调停滞、暂停、过期健康回调和应用关闭；缓冲测试覆盖立体声、分离声道、蓝牙单声道和缓冲尾部清零。
@@ -56,7 +67,7 @@ swiftc -O Tests/CommunicationRoutingTests.swift Sources/CommunicationRoutingPoli
 
 ```bash
 xcodegen generate --spec project.yml
-xcodebuild -project SoundMate.xcodeproj -scheme SoundMate -configuration Release build
+xcodebuild -project SoundMate.xcodeproj -scheme SoundMate -configuration Release ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO build
 ```
 
-当前工程默认生成 `arm64 + x86_64` Universal 版本，最低支持 macOS 14.2。
+上述命令显式构建 `arm64 + x86_64` Universal 版本，最低支持 macOS 14.2。

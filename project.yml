@@ -21,8 +21,8 @@ targets:
       base:
         PRODUCT_NAME: SoundMate
         PRODUCT_BUNDLE_IDENTIFIER: com.ivandrew.soundmate.communication
-        MARKETING_VERSION: "3.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "3.1.0"
+        CURRENT_PROJECT_VERSION: "2"
         CODE_SIGN_STYLE: Manual
         CODE_SIGN_IDENTITY: "-"
         ENABLE_HARDENED_RUNTIME: YES
@@ -38,8 +38,8 @@ targets:
       properties:
         CFBundleDisplayName: SoundMate
         CFBundleName: SoundMate
-        CFBundleShortVersionString: "3.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "3.1.0"
+        CFBundleVersion: "2"
         CFBundleIconFile: AppIcon
         LSApplicationCategoryType: public.app-category.utilities
         LSUIElement: true
